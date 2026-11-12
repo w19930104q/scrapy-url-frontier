@@ -15,6 +15,7 @@ from urlfrontier.grpc.urlfrontier_pb2_grpc import URLFrontierStub
 from urlfrontier.grpc.urlfrontier_pb2 import AnyCrawlID, GetParams, URLInfo, URLItem, DiscoveredURLItem, KnownURLItem, StringList, QueueWithinCrawlParams, Pagination, Local, DeleteCrawlMessage, Active
 
 from urlfrontier.distribution import HashRingDistributor, urlInfo_to_request
+from urlfrontier.rebalance import Rebalancer, RebalanceConfig, MigrationJournal, RebalanceInProgress
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s: %(levelname)s - %(name)s - %(message)s')
 
@@ -109,11 +110,35 @@ def main():
 
     # Add a parser a subcommand:
     parser_setactive = subparsers.add_parser(
-        'set-active', 
+        'set-active',
         help='Set the active status of the URLFrontier.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         parents=[common_parser])
     parser_setactive.add_argument('-A', '--active', action=argparse.BooleanOptionalAction, required=True, help="Activate/deactivate the getting URLs from frontier.")
+
+    # Add a parser for the rebalance operation:
+    parser_rebalance = subparsers.add_parser(
+        'rebalance',
+        help='Resumably migrate queues when the number of spider partitions changes (e.g. 2/2 -> 1/3).',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        parents=[common_parser, crawlid_parser])
+    parser_rebalance.add_argument('--from-partitions', '-O', type=int, required=True,
+        help="The old number of partitions (N in the current SPIDER_PARTITION_ID=I/N).")
+    parser_rebalance.add_argument('--to-partitions', '-T', type=int, required=True,
+        help="The new number of partitions to migrate to.")
+    parser_rebalance.add_argument('--partition-separator', default=".",
+        help="Character separating the spider name from the partition number.")
+    parser_rebalance.add_argument('--journal-dir', default="./.urlfrontier-rebalance",
+        help="Directory for the crash-recovery migration journal.")
+    parser_rebalance.add_argument('--batch-size', type=int, default=100,
+        help="Number of URLs to read/copy per drain page.")
+    parser_rebalance.add_argument('--workers', type=int, default=4,
+        help="Number of host queues migrated concurrently.")
+    parser_rebalance.add_argument('--claim-hold-seconds', type=int, default=300,
+        help="How long each drained URL is held in process while being copied.")
+    parser_rebalance.add_argument('--empty-read-grace', type=float, default=30.0,
+        help="Seconds to retry a queue that reads empty while URLs remain "
+             "(politeness window), before deferring it to a later re-run.")
 
     # And PARSE it:
     args = parser.parse_args()
@@ -236,6 +261,44 @@ def main():
             )
             deleted = stub.DeleteQueue(d)
             print(f"Deleted {deleted.value} URLs from queue {queue} of crawl {crawlID}.")
+        elif args.op == 'rebalance':
+            if args.crawl_id is None:
+                parser.error("rebalance requires a crawl ID (-C/--crawl-id), i.e. the spider name.")
+            config = RebalanceConfig(
+                spider_name=args.crawl_id,
+                old_partitions=args.from_partitions,
+                new_partitions=args.to_partitions,
+                separator=args.partition_separator,
+                journal_dir=args.journal_dir,
+                max_urls_per_queue=args.batch_size,
+                migration_workers=args.workers,
+                claim_hold_seconds=args.claim_hold_seconds,
+                empty_read_grace_seconds=args.empty_read_grace,
+            )
+            journal = MigrationJournal(
+                journal_dir=args.journal_dir,
+                spider_name=args.crawl_id,
+                old_n=args.from_partitions,
+                new_n=args.to_partitions,
+            )
+            migrator = Rebalancer(stub, config)
+            try:
+                with journal:
+                    results = migrator.run(journal)
+            except RebalanceInProgress as e:
+                raise SystemExit(f"ERROR: {e}")
+            if not results:
+                print("No queues need to move between these partition layouts.")
+            for r in results:
+                print(f"{r.key}: {r.source_crawl} -> {r.target_crawl} [{r.state}] "
+                      f"({r.copied} URLs copied)")
+            pending = journal.pending()
+            if pending:
+                raise SystemExit(
+                    f"WARNING: {len(pending)} queue(s) not fully migrated; "
+                    f"re-run the same command to resume."
+                )
+            print(f"Rebalance {args.from_partitions} -> {args.to_partitions} complete.")
         else:
             raise Exception("Unrecognized operation " + args.op)
 

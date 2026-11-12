@@ -15,7 +15,7 @@ from scrapy.http.request import Request
 from scrapy.http.response import Response
 #from scrapy.core.scheduler import BaseScheduler, SchedulerTV
 from scrapy.utils.job import job_dir
-from scrapy.utils.misc import create_instance, load_object
+from scrapy.utils.misc import load_object
 
 import grpc
 from urlfrontier.grpc.urlfrontier_pb2_grpc import URLFrontierStub
@@ -62,7 +62,7 @@ class URLFrontierScheduler():
             self.num_spiders = 1
         else:
             # Validate the X/N string:
-            pattern = re.compile("^\d+\/\d+$")
+            pattern = re.compile(r"^\d+\/\d+$")
             if not pattern.match(spider_partition_id):
                 raise Exception("SPIDER_PARTITION_ID must be in the form X/N, e.g. 1/2.")
             # Parse the partition ID

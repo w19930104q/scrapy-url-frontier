@@ -14,6 +14,23 @@ from w3lib.url import canonicalize_url
 
 logger = logging.getLogger(__name__)
 
+
+def normalize_queue_key(key):
+    """
+    Normalize a URL Frontier queue key so the hash ring makes the same routing
+    decision regardless of incidental formatting.
+
+    Queue keys are hostnames in practice (see ``set_spider_id``, which uses
+    the downloader slot key / URL hostname), so lower-casing and stripping
+    surrounding whitespace is enough.  Empty/None keys fall back to the
+    frontier's own default-key behaviour and are returned unchanged.
+    """
+    if key is None:
+        return None
+    normalized = key.strip().lower()
+    return normalized
+
+
 #  Convert Request to URLInfo
 def request_to_urlInfo(request: scrapy.Request, crawlID=None, queue=None, encoder=None, keep_fragments=False):
 
@@ -104,6 +121,9 @@ class HashRingDistributor():
             slot_key = spider.crawler.engine.downloader._get_slot_key(request, spider)
         else:
             slot_key = urlparse(request.url).hostname
+
+        # Normalize so rebalancing and enqueueing hash identically:
+        slot_key = normalize_queue_key(slot_key)
 
         logger.info(f"Got slot key {slot_key} for {request}")
 

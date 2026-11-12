@@ -10,6 +10,7 @@ scrapy-url-frontier <!-- omit in toc -->
 - [Example Spider](#example-spider)
 - [URL Frontier Command-Line Client](#url-frontier-command-line-client)
 - [Distributed Crawls](#distributed-crawls)
+- [Rebalancing Partitions](#rebalancing-partitions)
 - [Complex Requests & Alternative Encoders](#complex-requests--alternative-encoders)
 - [Development Setup](#development-setup)
   - [Updating the gRPC API code:](#updating-the-grpc-api-code)
@@ -84,7 +85,7 @@ For each crawl, you can list URLs using e.g.
 
     scrapy-url-frontier list-urls -u localhost:7071 -C example
 
-The full list of commands is:  `get-stats,list-crawls,delete-crawl,list-queues,delete-queue,list-urls,put-urls,get-active,set-active`. For more information, see the command line help e.g. `scrapy-url-frontier -h` or `scrapy-url-frontier list-queues -h`. 
+The full list of commands is:  `get-stats,list-crawls,delete-crawl,list-queues,delete-queue,list-urls,put-urls,get-active,set-active,rebalance`. For more information, see the command line help e.g. `scrapy-url-frontier -h` or `scrapy-url-frontier list-queues -h`. 
 
 ## Distributed Crawls
 
@@ -105,6 +106,59 @@ The `put-urls` command also needs to be aware of the number of partitions so it 
     scrapy-url-frontier put-urls -u localhost:7071 -C example -N 2 https://example.org/
 
 The system uses a consistent hashing method to distribute the URLs. This minimizes the disruption if the number of partitions changes, e.g. if a `N=4` crawl is stopped and restarted with `N=5`, only one fifth of the URLs will be affected. However, during the period while the URLs are being drained out of the `N=4` scheme, new URLs for the same hosts will arrive in the fifth partition and so those affected sites will be crawled at a higher rate. This issue is noted [here](https://github.com/anjackson/scrapy-url-frontier/issues/3).
+
+## Rebalancing Partitions
+
+Simply swapping the hash ring when the partition count changes is unsafe: the old crawl ID's queue and a new partition can then both hand out the same host at the same time, while deleting the old crawl outright can lose URLs that have not been copied. The `rebalance` command instead performs an online, crash-safe migration of one *queue* (one normalized host key) at a time, using only the public URL Frontier 2.3.1 gRPC API.
+
+### Protocol
+
+Each queue whose ring placement changes moves through a strict state machine. Because a blocked queue is invisible to *every* `GetURLs` call (including explicit-key reads), the host never has two active owners:
+
+1. **Blocked** — `BlockQueueUntil` locks the source queue immediately. From that instant nobody can serve the host: it has zero, and then exactly one, active owner. Unaffected hosts continue to be served normally.
+2. **Drained** — the migrator first waits for any URLs already held "in process" by a spider to age out (the block prevents new holds). It then repeatedly opens a short unblock window in which `GetURLs` atomically claims one page of due URLs, copies each `URLInfo` verbatim (full metadata, so `dont_filter`, Frontera codecs and custom state survive) to the destination crawl via `PutURLs`, and re-blocks the queue. The claim hold deliberately outlasts the queue's one-second politeness delay, so successive pages walk the whole queue rather than re-reading its head.
+3. **Quiesced** — `GetStats` confirms that every active URL still in the source is held in process by the migrator and therefore already safely stored at the destination.
+4. **Deleted** — only now is `DeleteQueue` called. Nothing is deleted before the destination has acknowledged every item.
+
+`PutURLs` is an idempotent upsert keyed on the canonical URL, so re-sending a URL never duplicates it (discovered duplicates are skipped, known items overwrite). Different host queues are migrated concurrently (four workers by default), while each individual queue still passes through the block-first sequence on its own.
+
+### Crash recovery
+
+Every state transition is appended to an fsync-ed write-ahead journal under `--journal-dir`, and an advisory file lock (`flock`) guarantees that only one migrator process runs per spider/job. If the process is killed at any point — mid-block, mid-drain, or around the delete — re-running the identical command resumes each queue from its last recorded state:
+
+- URLs already copied are deduplicated by the destination, so replay never duplicates a crawl.
+- The source queue is only deleted after the fully-claimed check passes, so replay never loses one either.
+- A queue whose block TTL expires while no migrator is alive simply unlocks itself; the next run re-applies the block.
+
+Queues that genuinely cannot be drained now — for example URLs with a future `refetchable_from_date` that no `GetURLs` can yet return — are left blocked and reported as pending rather than deleted with data still in them. Re-running the command later completes them.
+
+### Usage
+
+Before changing `SPIDER_PARTITION_ID` in the spider deployment, run the migration against the same frontier, naming the spider and both partition counts:
+
+    # Scale up, e.g. 2 partitions -> 3:
+    scrapy-url-frontier rebalance -u localhost:7071 -C example \
+        --from-partitions 2 --to-partitions 3
+
+    # Scale down, e.g. 3 partitions -> 2:
+    scrapy-url-frontier rebalance -u localhost:7071 -C example \
+        --from-partitions 3 --to-partitions 2
+
+The command prints one line per moved queue (`source -> target [state] (N URLs copied)`). If any queue is deferred, it exits with a warning telling you to re-run; a completed rebalance followed by another invocation is a no-op. Useful options (see `rebalance -h` for all):
+
+- `--journal-dir` — location of the recovery journal (default `./.urlfrontier-rebalance`); keep it on durable storage and reuse the same directory for retries of the same job.
+- `--workers` — number of host queues migrated concurrently.
+- `--batch-size` — URLs read and copied per drain page.
+- `--claim-hold-seconds` — how long a drained URL is held in process while being copied; must exceed the per-queue politeness delay.
+- `--empty-read-grace` — how long to keep retrying a queue that reads empty while URLs remain (its politeness window) before deferring it as future-dated.
+
+Only queue keys whose owner node differs between the old and new rings are touched; every other queue is left exactly where it was.
+
+### Tests
+
+The migration is covered by an in-process fake of the URL Frontier gRPC service (`urlfrontier/testing.py`) — no external service is required. The regression suite (`urlfrontier/test_rebalance.py`) drives scale-up, scale-down, repeated/idempotent runs, crashes injected at every phase with journal replay, concurrent `next_request` ownership checks, parallel host migration, and the scheduler's `dont_filter`/partition compatibility:
+
+    python -m unittest urlfrontier.test_rebalance urlfrontier.test_scheduler
 
 ## Complex Requests & Alternative Encoders
 
